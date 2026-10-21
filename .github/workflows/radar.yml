@@ -11,6 +11,7 @@ on:
         type: choice
         options: [daily, sources]
         default: daily
+  # 配置提交会执行免费日报，用于部署后的首次验证。
   push:
     branches: [main]
     paths:
