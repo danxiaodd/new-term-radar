@@ -1,36 +1,24 @@
-name: New-term radar
-
-# Two schedules, one state:
-#   sources  every 8 hours: X and Hugging Face, where a name is said first. Posts a
-#            report only when there is a new name.
-#   daily    once a day: everything else, the review of leads from 14 days ago, and the
-#            source leads of the last day.
-#
-# Off until you opt in: set the repository variable RADAR_ENABLED to "true"
-# (Settings > Secrets and variables > Actions > Variables), add the secret AISA_API_KEY,
-# and commit your config.json (remove it from .gitignore first; it holds no secrets).
-# Optional secrets: GOANYAPI_API_KEY (related queries in the keyword table),
-# RESEND_API_KEY, EMAIL_FROM, RADAR_EMAIL_TO (mail the reports),
-# GSC_TOKEN_JSON (the Search Console signal).
-#
-# State (state/radar.db and the snapshots) lives in the Actions cache: one entry per
-# run, restored by prefix, so the repository does not grow. A missing cache only means
-# the next run builds new snapshots and reports nothing that day; the leads database
-# would start over, so download the "radar-state" artifact now and then if you care
-# about the review's history.
+name: New-term radar (free, 中文)
 
 on:
   schedule:
-    - cron: "0 0,8,16 * * *"   # sources
-    - cron: "30 1 * * *"       # daily
+    - cron: '17 0,8,16 * * *'
+    - cron: '47 1 * * *'
   workflow_dispatch:
     inputs:
       command:
-        description: "daily or sources"
-        default: "daily"
+        description: '采集类型'
+        type: choice
+        options: [daily, sources]
+        default: daily
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/radar.yml'
+      - 'config.json'
 
 concurrency:
-  group: radar
+  group: radar-free
   cancel-in-progress: false
 
 permissions:
@@ -38,59 +26,89 @@ permissions:
 
 jobs:
   radar:
-    if: vars.RADAR_ENABLED == 'true'
+    # 自动开启；如需暂停，在仓库 Variables 设置 RADAR_ENABLED=false。
+    if: vars.RADAR_ENABLED != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      COMMAND: ${{ github.event.inputs.command || (github.event.schedule == '30 1 * * *' && 'daily' || 'sources') }}
+      TZ: Asia/Shanghai
+      PYTHONUTF8: '1'
+      COMMAND: ${{ github.event.inputs.command || (github.event.schedule == '17 0,8,16 * * *' && 'sources' || 'daily') }}
+      # 仅使用 GitHub 自带的临时 token。不读取或注入任何付费 API 密钥。
+      AISA_API_KEY: ''
+      GOANYAPI_API_KEY: ''
+      TRUSTMRR_API_KEY: ''
+      GSC_TOKEN_JSON: ''
+      RESEND_API_KEY: ''
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-
-      - run: pip install -r requirements.txt
-
-      - name: Restore the state
+          python-version: '3.12'
+      # 免费采集只依赖 Python 标准库，无需安装邮件或 MCP 依赖。
+      - name: Restore snapshots and database
         uses: actions/cache/restore@v4
         with:
           path: state
-          key: radar-state-${{ github.run_id }}
-          restore-keys: radar-state-
-
-      - name: Run the radar
+          key: radar-free-state-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: radar-free-state-v1-
+      - name: Collect free sources and generate Chinese report
         env:
-          AISA_API_KEY: ${{ secrets.AISA_API_KEY }}
-          GOANYAPI_API_KEY: ${{ secrets.GOANYAPI_API_KEY }}
           GITHUB_TOKEN: ${{ github.token }}
-          GSC_TOKEN_JSON: ${{ secrets.GSC_TOKEN_JSON }}
-          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
-          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
-          RADAR_EMAIL_TO: ${{ secrets.RADAR_EMAIL_TO }}
+        shell: bash
         run: |
-          if [ "$COMMAND" = "daily" ]; then
-            python -m radar daily --skip x,hf --out report.md ${RADAR_EMAIL_TO:+--mail}
+          set -euo pipefail
+          if [[ "$COMMAND" == 'sources' ]]; then
+            python -m radar sources --skip x,judge --out report.md 2>&1 | tee run.log
+          elif [[ "$COMMAND" == 'daily' ]]; then
+            python -m radar daily --skip x,judge,newsites,asks,sellers,review,usecases,tutorials,revenue,gsc --out report.md 2>&1 | tee run.log
           else
-            python -m radar sources --out report.md ${RADAR_EMAIL_TO:+--mail}
+            echo 'Unsupported command' >&2
+            exit 1
           fi
-          if [ -f report.md ]; then cat report.md >> "$GITHUB_STEP_SUMMARY"; fi
-
-      - name: Save the state
+          if [[ -s report.md ]]; then
+            cat report.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf '## 新词雷达：免费采集完成\n\n首次建立基线或本次无新增词。\n\n' >> "$GITHUB_STEP_SUMMARY"
+            cat run.log >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Check daily source health
+        if: env.COMMAND == 'daily'
+        shell: python
+        run: |
+          import json
+          from pathlib import Path
+          data = json.loads(Path('report.json').read_text())
+          errors = []
+          for source in ('hf', 'breakout'):
+              block = data[source]
+              print(f"{source}: {json.dumps(block, ensure_ascii=False)[:400]}")
+              if block.get('error') or block.get('skipped'):
+                  errors.append(source)
+          sites = data['sitemap'].get('sites', {})
+          for name, result in sites.items():
+              print(f"sitemap {name}: {json.dumps(result, ensure_ascii=False)}")
+              if result.get('error'):
+                  print(f"::warning::Sitemap {name} failed")
+          if sites and all(result.get('error') for result in sites.values()):
+              errors.append('all sitemaps')
+          if errors:
+              raise SystemExit('Free source errors: ' + ', '.join(errors))
+      - name: Save snapshots and database
         if: always()
         uses: actions/cache/save@v4
         with:
           path: state
-          key: radar-state-${{ github.run_id }}
-
-      - name: Keep the report and the state
+          key: radar-free-state-v1-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Keep report, logs and complete state backup
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: radar-${{ env.COMMAND }}-${{ github.run_id }}
+          name: radar-free-${{ env.COMMAND }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             report.md
             report.json
-            state/radar.db
-          if-no-files-found: ignore
-          retention-days: 30
+            run.log
+            state/
+          if-no-files-found: warn
+          retention-days: 14
