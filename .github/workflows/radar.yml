@@ -3,7 +3,7 @@ name: New-term radar (free, 中文)
 on:
   schedule:
     - cron: '17 0,8,16 * * *'
-    - cron: '47 1 * * *'
+    - cron: '0 0 * * *'
   workflow_dispatch:
     inputs:
       command:
